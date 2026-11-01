@@ -9,6 +9,7 @@
 //! - File → Open / Place use the browser file picker; bytes arrive asynchronously through
 //!   `Services::inbox` (`.designcraft` → `file.openBytes`, images → `file.place`);
 //! - Save and Export trigger a browser download;
+//! - unsaved documents are copied to IndexedDB and offered back after a crash or reload (`recovery`);
 //! - dropped files are read asynchronously by `web::WebShell` and delivered through the inbox.
 //!
 //! URL query flags: `?webgl` forces the WebGL2 backend instead of WebGPU; `?sample` opens the
@@ -18,6 +19,9 @@
 
 #[cfg(any(target_arch = "wasm32", test))]
 mod browser_policy;
+
+#[cfg(target_arch = "wasm32")]
+mod recovery;
 
 #[cfg(target_arch = "wasm32")]
 mod web;

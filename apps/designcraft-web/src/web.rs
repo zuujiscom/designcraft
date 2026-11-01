@@ -56,6 +56,8 @@ pub fn start() {
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
+        // Copies of unsaved documents a closed or crashed tab left, read before the app is built.
+        let mut startup = Some(crate::recovery::open().await);
         let runner = eframe::WebRunner::new();
         let creator_graphics = graphics.clone();
         let result = runner
@@ -76,12 +78,27 @@ pub fn start() {
                     if has_query_flag(&query(), "sample") {
                         let _ = app.run("file.newSample", serde_json::json!({}));
                     }
-                    Ok(Box::new(WebShell { app, inbox, graphics: creator_graphics }))
+                    let Some(st) = startup.take() else { return Err("recovery store missing".into()) };
+                    let mut adopted = Vec::new();
+                    if !has_query_flag(&query(), "sample") {
+                        let (opened, message) = crate::recovery::restore(&mut app.session, &st.recovered);
+                        adopted = opened;
+                        if let Some(m) = message {
+                            app.status(m);
+                        }
+                    }
+                    for w in &st.warnings {
+                        log::warn!("crash recovery: {w}");
+                    }
+                    let recovery = crate::recovery::WebRecovery::new(st.store, adopted);
+                    recovery.set_waker(&cc.egui_ctx);
+                    Ok(Box::new(WebShell { app, inbox, graphics: creator_graphics, recovery }))
                 }),
             )
             .await;
         match result {
             Ok(()) => {
+                install_autosave_hooks(&runner);
                 if let Err(e) = install_recovery_controls(&runner, &canvas, &graphics) {
                     graphics_failed(&graphics, GRAPHICS_TITLE, GRAPHICS_MESSAGE, &format!("Couldn't install graphics recovery controls: {e:?}"));
                     if let Some(shell) = runner.app_mut::<WebShell>()
@@ -345,12 +362,38 @@ struct WebShell {
     app: DesignApp,
     inbox: Inbox,
     graphics: GraphicsState,
+    recovery: crate::recovery::WebRecovery,
+}
+
+/// Ask before leaving with unsaved documents, and write their copies when the tab is hidden.
+/// Both live as long as the page.
+fn install_autosave_hooks(runner: &eframe::WebRunner) {
+    let guard_runner = runner.clone();
+    match craft_web_recovery::UnloadGuard::new(move || {
+        guard_runner.app_mut::<WebShell>().is_some_and(|shell| crate::recovery::WebRecovery::unsaved(&shell.app.session))
+    }) {
+        Ok(guard) => std::mem::forget(guard),
+        Err(e) => log::warn!("couldn't install the unsaved-changes guard: {e}"),
+    }
+    let hidden_runner = runner.clone();
+    match craft_web_recovery::HiddenHook::new(move || {
+        if let Some(mut shell) = hidden_runner.app_mut::<WebShell>() {
+            let shell = &mut *shell;
+            if !shell.graphics.has_failed() {
+                shell.recovery.tick(&shell.app.session, None, true);
+            }
+        }
+    }) {
+        Ok(hook) => std::mem::forget(hook),
+        Err(e) => log::warn!("couldn't install the hidden-tab hook: {e}"),
+    }
 }
 
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let graphics = self.graphics.clone();
         let _ = graphics.run_if_healthy(|| self.app.logic(ctx));
+        let _ = graphics.run_if_healthy(|| self.recovery.tick(&self.app.session, Some(ctx), false));
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
